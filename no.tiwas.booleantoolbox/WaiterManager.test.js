@@ -225,3 +225,240 @@ describe('WaiterManager orphan cleanup', () => {
     expect(cleanupOrphans).not.toHaveBeenCalled();
   });
 });
+
+describe('WaiterManager reused waiter IDs and background waiters', () => {
+  let manager;
+
+  beforeEach(() => {
+    jest.useFakeTimers();
+    jest.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+    WaiterManager.instance = null;
+    manager = new WaiterManager({}, createLogger());
+  });
+
+  afterEach(() => {
+    manager.destroy();
+    WaiterManager.instance = null;
+    jest.useRealTimers();
+  });
+
+  test('exposes the safe in-card wait limit below Homey\'s 60 second Flow card limit', () => {
+    expect(WaiterManager.FLOW_CARD_SAFE_WAIT_MS).toBe(55000);
+  });
+
+  test('re-initializing a waiter settles the superseded Flow run once with false', async () => {
+    await manager.createWaiter('Wait_OSB_Motion', { timeoutValue: 120000, timeoutUnit: 'ms' }, { flowId: 'unknown' });
+    const first = manager.waiters.get('Wait_OSB_Motion');
+    first.resolver = jest.fn();
+
+    await manager.createWaiter('Wait_OSB_Motion', { timeoutValue: 120000, timeoutUnit: 'ms' }, { flowId: 'unknown' });
+    const second = manager.waiters.get('Wait_OSB_Motion');
+    second.resolver = jest.fn();
+
+    expect(first.resolver).toHaveBeenCalledTimes(1);
+    expect(first.resolver).toHaveBeenCalledWith(false);
+    expect(second).not.toBe(first);
+
+    // The replaced waiter's timeout was cleared and never touches its successor.
+    await jest.advanceTimersByTimeAsync(119999);
+    expect(first.resolver).toHaveBeenCalledTimes(1);
+    expect(second.resolver).not.toHaveBeenCalled();
+    expect(manager.waiters.get('Wait_OSB_Motion')).toBe(second);
+
+    await jest.advanceTimersByTimeAsync(1);
+    expect(second.resolver).toHaveBeenCalledWith(false);
+    expect(manager.waiters.has('Wait_OSB_Motion')).toBe(false);
+  });
+
+  test('removeWaiterIfCurrent leaves a successor with the same ID alone', async () => {
+    await manager.createWaiter('reused', { timeoutValue: 0, timeoutUnit: 'ms' }, { flowId: 'flow-1' });
+    const first = manager.waiters.get('reused');
+    manager.removeWaiterById('reused');
+    await manager.createWaiter('reused', { timeoutValue: 0, timeoutUnit: 'ms' }, { flowId: 'flow-1' });
+    const second = manager.waiters.get('reused');
+
+    expect(manager.removeWaiterIfCurrent('reused', first)).toBe(false);
+    expect(manager.waiters.get('reused')).toBe(second);
+    expect(manager.removeWaiterIfCurrent('reused', second)).toBe(true);
+    expect(manager.waiters.has('reused')).toBe(false);
+  });
+
+  test('ignores capability events from a replaced waiter', async () => {
+    const listeners = [];
+    const homey = { devices: { getDevice: jest.fn().mockResolvedValue({
+      makeCapabilityInstance: jest.fn(async (capability, listener) => {
+        listeners.push(listener);
+        return { destroy: jest.fn() };
+      }),
+    }) } };
+    const deviceConfig = { deviceId: 'device-1', capability: 'onoff', targetValue: 'true' };
+
+    await manager.createWaiter('motion', { timeoutValue: 0, timeoutUnit: 'ms' }, { flowId: 'unknown' }, deviceConfig);
+    const first = manager.waiters.get('motion');
+    first.resolver = jest.fn();
+    await manager.registerCapabilityListener('motion', homey);
+
+    await manager.createWaiter('motion', { timeoutValue: 0, timeoutUnit: 'ms' }, { flowId: 'unknown' }, deviceConfig);
+    const second = manager.waiters.get('motion');
+    second.resolver = jest.fn();
+    await manager.registerCapabilityListener('motion', homey);
+
+    // A late event delivered to the old listener must not resolve or remove the successor.
+    await listeners[0](true);
+    expect(second.resolver).not.toHaveBeenCalled();
+    expect(manager.waiters.get('motion')).toBe(second);
+
+    await listeners[1](true);
+    expect(second.resolver).toHaveBeenCalledWith(true);
+    expect(manager.waiters.has('motion')).toBe(false);
+  });
+
+  test('a second listener registration for the same waiter is dropped', async () => {
+    const instances = [];
+    const homey = { devices: { getDevice: jest.fn().mockResolvedValue({
+      makeCapabilityInstance: jest.fn(async () => {
+        const instance = { destroy: jest.fn() };
+        instances.push(instance);
+        return instance;
+      }),
+    }) } };
+    await manager.createWaiter('double', { timeoutValue: 0, timeoutUnit: 'ms' }, { flowId: 'unknown' },
+      { deviceId: 'device-1', capability: 'onoff', targetValue: 'true' });
+
+    await Promise.all([
+      manager.registerCapabilityListener('double', homey),
+      manager.registerCapabilityListener('double', homey),
+    ]);
+
+    expect(instances).toHaveLength(2);
+    expect(manager.waiters.get('double').capabilityListener.instance).toBe(instances[0]);
+    expect(instances[1].destroy).toHaveBeenCalledTimes(1);
+    manager.removeWaiter('double');
+    expect(instances[0].destroy).toHaveBeenCalledTimes(1);
+  });
+
+  test('expireWaiter completes an enabled waiter once and never touches a replaced one', async () => {
+    await manager.createWaiter('expire', { timeoutValue: 1, timeoutUnit: 'm' }, { flowId: 'unknown' });
+    const first = manager.waiters.get('expire');
+    first.resolver = jest.fn();
+    expect(first.timeoutAt).toBe(Date.now() + 60000);
+
+    await manager.createWaiter('expire', { timeoutValue: 1, timeoutUnit: 'm' }, { flowId: 'unknown' });
+    const second = manager.waiters.get('expire');
+    second.resolver = jest.fn();
+
+    expect(manager.expireWaiter(first)).toBe(false);
+    expect(manager.waiters.get('expire')).toBe(second);
+    expect(manager.expireWaiter(second)).toBe(true);
+    expect(second.resolver).toHaveBeenCalledWith(false);
+    expect(manager.waiters.has('expire')).toBe(false);
+    await jest.advanceTimersByTimeAsync(60000);
+    expect(second.resolver).toHaveBeenCalledTimes(1);
+  });
+
+  test('restarting a background waiter replaces it without calling its onFinish', async () => {
+    const firstFinish = jest.fn();
+    const secondFinish = jest.fn();
+    const gateConfig = { gateName: 'Razor', targetState: 'GO' };
+    const id = manager.getBackgroundGateWaiterId('Razor');
+
+    const first = await manager.startBackgroundWaiter(id, { timeoutValue: 2, timeoutUnit: 'm' }, null, gateConfig, firstFinish);
+    await jest.advanceTimersByTimeAsync(60000);
+    const second = await manager.startBackgroundWaiter(id, { timeoutValue: 2, timeoutUnit: 'm' }, null, gateConfig, secondFinish);
+
+    expect(second).not.toBe(first);
+    expect(first.background).toBe(true);
+    expect(manager.virtualGates.get('Razor').waiters.size).toBe(1);
+
+    await jest.advanceTimersByTimeAsync(60000);
+    expect(firstFinish).not.toHaveBeenCalled();
+    expect(secondFinish).not.toHaveBeenCalled();
+
+    await jest.advanceTimersByTimeAsync(60000);
+    expect(firstFinish).not.toHaveBeenCalled();
+    expect(secondFinish).toHaveBeenCalledTimes(1);
+    expect(secondFinish).toHaveBeenCalledWith(expect.objectContaining({ id, success: false, waitedMs: 120000 }));
+  });
+
+  test('a background waiter does not take over a pending in-card waiter with the same ID', async () => {
+    await manager.createWaiter('shared', { timeoutValue: 0, timeoutUnit: 'ms' }, { flowId: 'unknown' });
+
+    await expect(manager.startBackgroundWaiter('shared', { timeoutValue: 1, timeoutUnit: 'm' }))
+      .rejects.toThrow('Waiter ID "shared" already exists');
+    expect(manager.waiters.get('shared').background).toBeUndefined();
+  });
+
+  test('background waiters of another kind are never restarted by a start with the same ID', async () => {
+    const gateFinish = jest.fn();
+    const gateWaiter = await manager.startBackgroundWaiter('gate_Razor_background', { timeoutValue: 1, timeoutUnit: 'm' },
+      null, { gateName: 'Razor', targetState: 'GO' }, gateFinish);
+    expect(gateWaiter.kind).toBe('gate');
+
+    await expect(manager.startBackgroundWaiter('gate_Razor_background', { timeoutValue: 1, timeoutUnit: 'm' },
+      { deviceId: 'device-1', capability: 'onoff', targetValue: 'true' }))
+      .rejects.toThrow('is already used by a Conditional Gate wait');
+    expect(manager.waiters.get('gate_Razor_background')).toBe(gateWaiter);
+    expect(manager.cancelBackgroundWaiter('gate_Razor_background', 'capability')).toBe(false);
+
+    await manager.startBackgroundWaiter('kettle', { timeoutValue: 1, timeoutUnit: 'm' },
+      { deviceId: 'device-1', capability: 'onoff', targetValue: 'true' });
+    expect(() => manager.assertBackgroundKind('kettle', 'gate')).toThrow('is already used by a capability wait');
+    expect(() => manager.assertBackgroundKind('kettle', 'capability')).not.toThrow();
+
+    await jest.advanceTimersByTimeAsync(60000);
+    expect(gateFinish).toHaveBeenCalledTimes(1);
+  });
+
+  test('background start generations order overlapping starts per kind and ID', () => {
+    const first = manager.beginBackgroundStart('capability', 'kettle');
+    expect(manager.isLatestBackgroundStart('capability', 'kettle', first)).toBe(true);
+
+    const second = manager.beginBackgroundStart('capability', 'kettle');
+    expect(manager.isLatestBackgroundStart('capability', 'kettle', first)).toBe(false);
+    expect(manager.isLatestBackgroundStart('capability', 'kettle', second)).toBe(true);
+
+    // Other IDs and kinds have their own sequence.
+    const gate = manager.beginBackgroundStart('gate', 'kettle');
+    expect(manager.isLatestBackgroundStart('capability', 'kettle', second)).toBe(true);
+    expect(manager.isLatestBackgroundStart('gate', 'kettle', gate)).toBe(true);
+  });
+
+  test('waitedMs counts from the given start time', async () => {
+    const onFinish = jest.fn();
+    const startedAt = Date.now() - 5000;
+    await manager.startBackgroundWaiter('timed', { timeoutValue: 5000, timeoutUnit: 'ms' }, null, null, onFinish, { startedAt });
+
+    await jest.advanceTimersByTimeAsync(5000);
+
+    expect(onFinish).toHaveBeenCalledWith(expect.objectContaining({ id: 'timed', success: false, waitedMs: 10000 }));
+  });
+
+  test('updateWaiter clamps a new timeout to 24 hours and keeps 0 as no timeout', async () => {
+    await manager.createWaiter('modified', { timeoutValue: 1, timeoutUnit: 'm' }, { flowId: 'unknown' });
+    const waiter = manager.waiters.get('modified');
+    waiter.resolver = jest.fn();
+
+    expect(manager.updateWaiter('modified', { timeoutMs: 48 * 3600000 })).toBe(true);
+    expect(waiter.timeoutMs).toBe(manager.MAX_TIMEOUT_MS);
+    expect(waiter.timeoutAt).toBe(Date.now() + manager.MAX_TIMEOUT_MS);
+
+    manager.updateWaiter('modified', { timeoutMs: 0 });
+    expect(waiter.timeoutMs).toBe(0);
+    expect(waiter.indefiniteSince).toBe(Date.now());
+
+    manager.updateWaiter('modified', { timeoutMs: 5 });
+    expect(waiter.timeoutMs).toBe(manager.MIN_TIMEOUT_MS);
+    await jest.advanceTimersByTimeAsync(manager.MIN_TIMEOUT_MS);
+    expect(waiter.resolver).toHaveBeenCalledWith(false);
+  });
+
+  test('stopping a background waiter never calls onFinish', async () => {
+    const onFinish = jest.fn();
+    await manager.startBackgroundWaiter('bg', { timeoutValue: 1, timeoutUnit: 'm' }, null, null, onFinish);
+
+    expect(manager.stopWaiter('bg')).toBe(1);
+    await jest.advanceTimersByTimeAsync(2 * 60000);
+
+    expect(onFinish).not.toHaveBeenCalled();
+  });
+});

@@ -11,6 +11,8 @@ class WaiterManager {
         this.waiters = new Map();
         this.flowTracking = new Map();
         this.virtualGates = new Map(); // gateName -> { state, waiters: Set<waiterId> }
+        // "<kind>:<waiterId>" -> number of background starts, used to order overlapping starts
+        this.backgroundStartGenerations = new Map();
         this.MAX_WAITERS = 100;
         this.MAX_TIMEOUT_MS = 24 * 60 * 60 * 1000;
         // A no-timeout waiter represents a running Flow. Keep it long enough for
@@ -21,6 +23,12 @@ class WaiterManager {
         this.cleanupInterval = setInterval(() => this.cleanupOrphans(), 60000);
         WaiterManager.instance = this;
         this.logger.info('🔧 WaiterManager initialized');
+    }
+
+    static getWaiterKind(deviceConfig, virtualGateConfig) {
+        if (deviceConfig) return 'capability';
+        if (virtualGateConfig) return 'gate';
+        return 'generic';
     }
 
     generateWaiterId() {
@@ -61,7 +69,13 @@ class WaiterManager {
         const existing = this.waiters.get(id);
         if (existing && existing.flowId === flowContext.flowId) {
             this.logger.debug(`♻️  Re-initializing existing waiter: ${id}`);
+            const previousResolver = existing.resolver;
             this.removeWaiterById(id);
+            // Settle the superseded Flow card run through its NO/false path so it
+            // does not hang until Homey kills it at the 60 second card limit.
+            if (previousResolver) {
+                try { previousResolver(false); } catch (e) { this.logger.error(e); }
+            }
         } else if (existing) {
             throw new Error(`Waiter ID "${id}" already exists`);
         }
@@ -81,6 +95,7 @@ class WaiterManager {
             config,
             deviceConfig,
             virtualGateConfig,
+            kind: WaiterManager.getWaiterKind(deviceConfig, virtualGateConfig),
             capabilityListener: null,
         };
 
@@ -102,21 +117,105 @@ class WaiterManager {
 
     setupTimeout(waiterData) {
         if (waiterData.timeoutHandle) clearTimeout(waiterData.timeoutHandle);
+        waiterData.timeoutHandle = null;
+        // Absolute time the configured timeout is due (null = no timeout).
+        waiterData.timeoutAt = waiterData.timeoutMs > 0 ? Date.now() + waiterData.timeoutMs : null;
         if (waiterData.timeoutMs > 0) {
-            waiterData.timeoutHandle = setTimeout(() => {
-                this.logger.warn(`⏰ Waiter "${waiterData.id}" timed out`);
-                if (waiterData.resolver) {
-                    try { waiterData.resolver(false); } catch (e) { this.logger.error(e); }
-                }
-                this.removeWaiter(waiterData.id);
-            }, waiterData.timeoutMs);
+            waiterData.timeoutHandle = setTimeout(() => this.expireWaiter(waiterData), waiterData.timeoutMs);
         }
+    }
+
+    /**
+     * Runs a waiter's timeout: resolves it as timed out (false) and removes it.
+     * Called by its own timer, and by the in-card Flow card guard when the
+     * configured timeout is due at the same moment as the guard.
+     *
+     * @returns {boolean} True when the waiter was completed as timed out
+     */
+    expireWaiter(waiterData) {
+        // A replaced waiter must never resolve or remove its successor.
+        if (this.waiters.get(waiterData.id) !== waiterData) return false;
+        if (!waiterData.enabled) {
+            // Disabled waiters stay in the waiting state; enableWaiter()
+            // completes the elapsed timeout when the waiter is re-enabled.
+            waiterData.timedOutWhileDisabled = true;
+            waiterData.timedOutAt = Date.now();
+            this.logger.info(`⏸️  Waiter "${waiterData.id}" timed out while disabled - completing when re-enabled`);
+            return false;
+        }
+        this.logger.warn(`⏰ Waiter "${waiterData.id}" timed out`);
+        if (waiterData.resolver) {
+            try { waiterData.resolver(false); } catch (e) { this.logger.error(e); }
+        }
+        this.removeWaiterIfCurrent(waiterData.id, waiterData);
+        return true;
     }
 
     enableWaiter(idPattern, enabled) {
         const matches = this.getWaitersByPattern(idPattern);
         for (const { data } of matches) data.enabled = enabled;
+        if (enabled) {
+            for (const { id, data } of matches) this.completeReEnabledWaiter(id, data);
+        }
         return matches.length;
+    }
+
+    /**
+     * Completes a waiter that was re-enabled while its condition is already
+     * met: the capability's last known value matches, or the gate is in the
+     * target state. Otherwise a timeout that elapsed while it was disabled is
+     * completed now. A waiter with neither keeps waiting.
+     */
+    completeReEnabledWaiter(id, waiterData) {
+        if (this.waiters.get(id) !== waiterData) return false;
+
+        if (waiterData.deviceConfig && this.settleCapabilityWaiterIfMatches(waiterData, waiterData.lastValue)) {
+            return true;
+        }
+
+        const gateName = waiterData.virtualGateConfig?.gateName;
+        if (gateName && this.virtualGates.has(gateName)) {
+            const gateState = this.virtualGates.get(gateName).state;
+            const targetState = waiterData.virtualGateConfig.targetState || 'GO';
+            if (gateState === targetState) {
+                if (waiterData.resolver) {
+                    try {
+                        waiterData.resolver({ gate_state: gateState === 'GO', gate_state_text: gateState });
+                    } catch (e) { this.logger.error(e); }
+                }
+                this.removeWaiterIfCurrent(id, waiterData);
+                return true;
+            }
+        }
+
+        if (waiterData.timedOutWhileDisabled) {
+            this.logger.warn(`⏰ Waiter "${id}" timed out (timeout elapsed while disabled)`);
+            if (waiterData.resolver) {
+                try { waiterData.resolver(false); } catch (e) { this.logger.error(e); }
+            }
+            this.removeWaiterIfCurrent(id, waiterData);
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Completes an enabled capability waiter when the given value matches its
+     * target. Used by the capability listener and by out-of-band reads (the
+     * re-check after the listener is installed, and re-enabling). Values seen
+     * while the waiter is disabled are only remembered; it keeps waiting.
+     *
+     * @returns {boolean} True when the waiter was completed
+     */
+    settleCapabilityWaiterIfMatches(waiterData, value) {
+        if (!waiterData?.deviceConfig || this.waiters.get(waiterData.id) !== waiterData) return false;
+        waiterData.lastValue = value;
+        if (!waiterData.enabled || !this.valueMatches(value, waiterData.deviceConfig.targetValue)) return false;
+        if (waiterData.resolver) {
+            try { waiterData.resolver(true); } catch (e) { this.logger.error(e); }
+        }
+        this.removeWaiterIfCurrent(waiterData.id, waiterData);
+        return true;
     }
 
     removeWaiter(idPattern) {
@@ -144,22 +243,144 @@ class WaiterManager {
         return true;
     }
 
+    /**
+     * Removes a waiter only if the given waiter object is still the one
+     * registered under that ID. Waiter IDs are reused (re-initialized Flow
+     * runs, restarted background waits), so stale timers and listeners must
+     * not remove the successor.
+     */
+    removeWaiterIfCurrent(id, waiterData) {
+        if (!waiterData || this.waiters.get(id) !== waiterData) return false;
+        return this.removeWaiterById(id);
+    }
+
+    getBackgroundGateWaiterId(gateName) {
+        return `gate_${gateName}_background`;
+    }
+
+    /**
+     * Starts a wait that is not bound to a Flow card run. The Flow card that
+     * starts it returns immediately; onFinish is called once when the waiter
+     * resolves (GO / capability match / timeout / orphan reaping). A pending
+     * background waiter with the same ID is replaced without calling its
+     * onFinish (restart semantics). Stopping or replacing a background waiter
+     * never calls onFinish.
+     */
+    async startBackgroundWaiter(id, config, deviceConfig = null, virtualGateConfig = null, onFinish = null, options = {}) {
+        if (!id || String(id).trim() === '') id = this.generateWaiterId();
+        const kind = WaiterManager.getWaiterKind(deviceConfig, virtualGateConfig);
+
+        // Only a background wait of the same kind is restarted; a Conditional Gate
+        // wait and a capability wait never cancel each other.
+        this.assertBackgroundKind(id, kind);
+        if (this.cancelBackgroundWaiter(id, kind)) {
+            this.logger.info(`🔁 Restarting background waiter: ${id}`);
+        }
+
+        // createWaiter() registers the waiter synchronously. Configure it before the
+        // first await so an overlapping start never sees a half-initialised waiter.
+        const previous = this.waiters.get(id);
+        const creation = this.createWaiter(
+            id,
+            config,
+            { flowId: WaiterManager.BACKGROUND_FLOW_ID, flowToken: null },
+            deviceConfig,
+            virtualGateConfig,
+        );
+        const waiterData = this.waiters.get(id);
+        if (!waiterData || waiterData === previous) {
+            await creation; // Surfaces the reason (e.g. the ID is used by a waiting condition card)
+            throw new Error(`Background waiter "${id}" could not be created`);
+        }
+        waiterData.background = true;
+
+        // waitedMs counts from when the start card ran (setup time included).
+        const startedAt = typeof options.startedAt === 'number' ? options.startedAt : waiterData.created;
+        let finished = false;
+        waiterData.resolver = (result) => {
+            if (finished) return;
+            finished = true;
+            if (typeof onFinish === 'function') {
+                onFinish({
+                    id,
+                    success: result !== false,
+                    result,
+                    waitedMs: Math.max(0, Date.now() - startedAt),
+                    lastValue: waiterData.lastValue,
+                });
+            }
+        };
+
+        await creation;
+        this.logger.info(`🕓 Background waiter started: ${id}`);
+        return waiterData;
+    }
+
+    /**
+     * Throws when a background waiter of another kind already uses this ID, e.g. a
+     * custom capability Waiter ID "gate_<name>_background". The existing waiter is
+     * left untouched.
+     */
+    assertBackgroundKind(id, kind) {
+        const existing = this.waiters.get(id);
+        if (!existing || !existing.background || existing.kind === kind) return;
+        if (existing.kind === 'gate') {
+            throw new Error(`Waiter ID "${id}" is already used by a Conditional Gate wait. Use a different Waiter ID.`);
+        }
+        if (existing.kind === 'capability') {
+            throw new Error(`Waiter ID "${id}" is already used by a capability wait ("Start waiting until device capability becomes value"). Stop that wait or give it a different Waiter ID.`);
+        }
+        throw new Error(`Waiter ID "${id}" is already used by another background wait.`);
+    }
+
+    /**
+     * Removes a pending background waiter of the given kind without finishing it
+     * (restart semantics). Waiters of another kind are never touched.
+     *
+     * @returns {boolean} True when a waiter was removed
+     */
+    cancelBackgroundWaiter(id, kind) {
+        const existing = this.waiters.get(id);
+        if (!existing || !existing.background || existing.kind !== kind) return false;
+        return this.removeWaiterIfCurrent(id, existing);
+    }
+
+    /**
+     * Registers a new start of a background wait and returns its ordering token.
+     * Call it synchronously when the start card begins, before any await.
+     */
+    beginBackgroundStart(kind, id) {
+        const key = `${kind}:${id}`;
+        const generation = (this.backgroundStartGenerations.get(key) || 0) + 1;
+        this.backgroundStartGenerations.set(key, generation);
+        return generation;
+    }
+
+    /**
+     * True while no newer start of the same background wait has begun. An older
+     * start must not replace, install or fire anything once this is false.
+     */
+    isLatestBackgroundStart(kind, id, token) {
+        return this.backgroundStartGenerations.get(`${kind}:${id}`) === token;
+    }
+
     async registerCapabilityListener(waiterId, homey) {
         const waiter = this.waiters.get(waiterId);
         if (!waiter || !waiter.deviceConfig) return;
         try {
             const device = await homey.devices.getDevice({ id: waiter.deviceConfig.deviceId });
             const listener = async (value) => {
-                if (this.valueMatches(value, waiter.deviceConfig.targetValue)) {
-                    if (waiter.resolver && waiter.enabled) waiter.resolver(true);
-                    this.removeWaiter(waiterId);
-                }
+                // Events for a waiter that was replaced or already finished are
+                // ignored; a disabled waiter only remembers the value and keeps waiting.
+                this.settleCapabilityWaiterIfMatches(waiter, value);
             };
             const instance = await device.makeCapabilityInstance(
                 waiter.deviceConfig.capability,
                 listener,
             );
-            if (this.waiters.get(waiterId) !== waiter) {
+            // Drop the instance if the waiter was removed/replaced meanwhile, or if an
+            // overlapping registration for the same waiter object already won.
+            if (this.waiters.get(waiterId) !== waiter || waiter.capabilityListener) {
                 try { instance?.destroy(); } catch (e) {}
                 return;
             }
@@ -235,7 +456,7 @@ class WaiterManager {
                         waiter.resolver({ gate_state: actualNewState === 'GO', gate_state_text: actualNewState });
                         triggered++;
                     } catch (e) { this.logger.error(e); }
-                    this.removeWaiter(waiterId);
+                    this.removeWaiterIfCurrent(waiterId, waiter);
                 }
             }
         }
@@ -248,9 +469,14 @@ class WaiterManager {
         
         if (updates.timeoutMs !== undefined) {
             const wasIndefinite = waiter.timeoutMs === 0;
-            waiter.timeoutMs = updates.timeoutMs;
+            // Same limits as at creation: 0 = no timeout, otherwise clamped to
+            // MIN_TIMEOUT_MS..MAX_TIMEOUT_MS (24 h), so orphan cleanup stays meaningful.
+            waiter.timeoutMs = this.validateTimeout(updates.timeoutMs);
             if (waiter.timeoutMs === 0 && !wasIndefinite) waiter.indefiniteSince = Date.now();
             if (waiter.timeoutMs !== 0) waiter.indefiniteSince = null;
+            // A new timeout replaces one that elapsed while the waiter was disabled.
+            waiter.timedOutWhileDisabled = false;
+            waiter.timedOutAt = null;
             this.setupTimeout(waiter);
             this.logger.info(`⏱️ Updated timeout for waiter "${id}" to ${waiter.timeoutMs}ms`);
         }
@@ -275,7 +501,7 @@ class WaiterManager {
         const results = [];
         for (const [id, data] of this.waiters.entries()) {
             if (query && !id.toLowerCase().includes(query.toLowerCase())) continue;
-            const typeInfo = data.deviceConfig ? 'Device' : (data.virtualGateConfig ? 'Gate' : 'Unknown');
+            const typeInfo = (data.deviceConfig ? 'Device' : (data.virtualGateConfig ? 'Gate' : 'Unknown')) + (data.background ? ', background' : '');
             const targetInfo = data.virtualGateConfig ? `${data.virtualGateConfig.gateName} (${data.virtualGateConfig.targetState || 'GO'})` : '';
             results.push({ name: id, description: `${data.enabled ? '✅' : '⏸️'} [${typeInfo}] ${targetInfo}`, id });
         }
@@ -287,10 +513,16 @@ class WaiterManager {
         let reaped = 0;
         for (const [id, waiter] of this.waiters.entries()) {
             const indefiniteSince = waiter.indefiniteSince ?? waiter.created;
-            if (waiter.timeoutMs !== 0 || now - indefiniteSince < this.MAX_ORPHAN_AGE_MS) continue;
+            const isOrphanIndefinite = waiter.timeoutMs === 0 && now - indefiniteSince >= this.MAX_ORPHAN_AGE_MS;
+            // A waiter whose timeout elapsed while disabled waits for re-enabling;
+            // reap it if nobody re-enables it within the orphan age.
+            const isOrphanDisabled = waiter.timedOutWhileDisabled === true
+                && now - (waiter.timedOutAt ?? now) >= this.MAX_ORPHAN_AGE_MS;
+            if (!isOrphanIndefinite && !isOrphanDisabled) continue;
 
-            this.logger.warn(`🧹 Reaping orphan waiter "${id}" after ${this.MAX_ORPHAN_AGE_MS}ms without a timeout`);
-            if (waiter.resolver) {
+            this.logger.warn(`🧹 Reaping orphan waiter "${id}" after ${this.MAX_ORPHAN_AGE_MS}ms without completing`);
+            // Disabled waiters never trigger, not even when they are reaped.
+            if (waiter.resolver && waiter.enabled) {
                 try { waiter.resolver(false); } catch (error) { this.logger.error(error); }
             }
             this.removeWaiterById(id);
@@ -303,9 +535,17 @@ class WaiterManager {
         if (this.cleanupInterval) clearInterval(this.cleanupInterval);
         for (const id of [...this.waiters.keys()]) this.removeWaiter(id);
         this.waiters.clear(); this.virtualGates.clear(); this.flowTracking.clear();
+        this.backgroundStartGenerations.clear();
         this.logger.info('🛑 WaiterManager destroyed');
     }
 }
 
 WaiterManager.instance = null;
+// Homey stops every app Flow card run listener after ~60 seconds. In-card
+// waits are ended just before that; longer waits use background waiters.
+WaiterManager.FLOW_CARD_SAFE_WAIT_MS = 55000;
+// Timer jitter allowed when an in-card wait's own timeout is due at the same
+// moment as the guard: the timeout (NO path) wins over the limit error.
+WaiterManager.FLOW_CARD_TIMEOUT_TIE_MS = 50;
+WaiterManager.BACKGROUND_FLOW_ID = 'background';
 module.exports = WaiterManager;
